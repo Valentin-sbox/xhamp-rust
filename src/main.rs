@@ -6,7 +6,6 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use futures_util::StreamExt;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -27,6 +26,7 @@ use tokio::time::sleep;
 use zip::ZipArchive;
 
 const PANEL_ADDRESS: &str = "127.0.0.1:8765";
+const DEFAULT_MYSQL_PORT: u16 = 3307;
 const PHP_CATALOG_URL: &str = "https://windows.php.net/downloads/releases/releases.json";
 const MARIADB_CATALOG_URL: &str = "https://downloads.mariadb.org/rest-api/mariadb/";
 const MAX_DOWNLOAD_BYTES: u64 = 512 * 1024 * 1024;
@@ -34,46 +34,54 @@ const MAX_EXPANDED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 #[derive(Clone)]
 struct AppState {
-    xampp: PathBuf,
     data: PathBuf,
-    php_version: String,
-    mysql_version: String,
     client: Client,
     processes: Arc<Mutex<Processes>>,
     install_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
-fn installed_versions(root: &Path) -> Vec<String> {
+fn installed_versions(root: &Path, kind: &str) -> Vec<String> {
     let Ok(entries) = fs::read_dir(root) else {
         return Vec::new();
     };
     let mut versions: Vec<_> = entries
         .filter_map(Result::ok)
-        .filter(|entry| entry.path().join("php.exe").is_file())
+        .filter(|entry| {
+            let path = entry.path();
+            match kind {
+                "php" => path.join("php.exe").is_file(),
+                _ => {
+                    (path.join("bin").join("mariadbd.exe").is_file()
+                        || path.join("bin").join("mysqld.exe").is_file())
+                        && (path.join("bin").join("mariadb-install-db.exe").is_file()
+                            || path.join("bin").join("mysql_install_db.exe").is_file())
+                }
+            }
+        })
         .filter_map(|entry| entry.file_name().into_string().ok())
         .collect();
-    versions.sort();
+    versions.sort_by(|left, right| version_cmp(left, right));
     versions
 }
 
 #[derive(Default)]
 struct Processes {
-    apache: Option<Child>,
     mysql: Option<Child>,
+    mysql_bin: Option<PathBuf>,
+    mysql_port: Option<u16>,
     php: Option<Child>,
 }
 
 #[derive(Serialize)]
 struct Status {
-    xampp_path: String,
-    xampp_found: bool,
-    php_version: String,
-    mysql_version: String,
-    apache: String,
+    data_path: String,
     mysql: String,
     php: String,
     selected_php: String,
+    selected_mariadb: String,
     installed_php: Vec<String>,
+    installed_mariadb: Vec<String>,
+    mysql_port: Option<u16>,
     projects: Vec<String>,
 }
 
@@ -107,6 +115,16 @@ struct SelectPhp {
 }
 
 #[derive(Deserialize)]
+struct SelectMariaDb {
+    version: String,
+}
+
+#[derive(Deserialize)]
+struct StartMariaDb {
+    port: u16,
+}
+
+#[derive(Deserialize)]
 struct InstallRelease {
     kind: String,
     version: String,
@@ -131,30 +149,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     fs::create_dir_all(data.join("runtimes").join("mariadb"))?;
     fs::create_dir_all(data.join("logs"))?;
 
-    let xampp = env::var_os("XAMPP_HOME")
-        .map(PathBuf::from)
-        .filter(|path| path.is_dir())
-        .or_else(|| {
-            [PathBuf::from(r"C:\xampp"), PathBuf::from(r"C:\XAMPP")]
-                .into_iter()
-                .find(|path| path.join("php").join("php.exe").is_file())
-        })
-        .unwrap_or_else(|| PathBuf::from(r"C:\xampp"));
-
     let client = Client::builder()
         .user_agent(concat!("XhampRust/", env!("CARGO_PKG_VERSION")))
         .timeout(Duration::from_secs(15 * 60))
         .build()?;
-    let php_version = executable_version(&xampp.join("php").join("php.exe"), "--version");
-    let mysql_version = executable_version(
-        &xampp.join("mysql").join("bin").join("mysqld.exe"),
-        "--version",
-    );
     let state = AppState {
-        xampp,
         data,
-        php_version,
-        mysql_version,
         client,
         processes: Arc::new(Mutex::new(Processes::default())),
         install_lock: Arc::new(tokio::sync::Mutex::new(())),
@@ -168,10 +168,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/php/start", post(start_php))
         .route("/api/php/stop", post(stop_php))
         .route("/api/php/select", post(select_php))
-        .route("/api/apache/start", post(start_apache))
-        .route("/api/apache/stop", post(stop_apache))
         .route("/api/mysql/start", post(start_mysql))
         .route("/api/mysql/stop", post(stop_mysql))
+        .route("/api/mysql/select", post(select_mariadb))
         .route("/api/install", post(install_release))
         .route("/api/projects/{name}", get(project_details))
         .layer(middleware::from_fn(validate_host))
@@ -209,32 +208,26 @@ async fn validate_host(request: Request, next: Next) -> Response {
 }
 
 async fn status(State(state): State<AppState>) -> ApiResult<Status> {
-    let apache_running = process_running(&state.processes, "apache");
     let mysql_managed = process_running(&state.processes, "mysql");
     let php_running = process_running(&state.processes, "php");
     let projects = list_projects(&state.data.join("projects"));
-    let selected_php = selected_php_path(&state)
-        .and_then(|path| version_from_path(&path))
-        .unwrap_or_else(|| "XAMPP".to_string());
+    let installed_php = installed_versions(&state.data.join("runtimes").join("php"), "php");
+    let installed_mariadb =
+        installed_versions(&state.data.join("runtimes").join("mariadb"), "mariadb");
+    let selected_php = selected_version(&state, "php").unwrap_or_else(|| "Ninguna".to_string());
+    let selected_mariadb =
+        selected_version(&state, "mariadb").unwrap_or_else(|| "Ninguna".to_string());
+    let mysql_port = active_mysql_port(&state.processes);
 
     Ok(Json(Status {
-        xampp_path: state.xampp.display().to_string(),
-        xampp_found: state.xampp.join("php").join("php.exe").is_file(),
-        php_version: state.php_version.clone(),
-        mysql_version: state.mysql_version.clone(),
-        apache: if apache_running {
-            "iniciado por el panel".to_string()
-        } else if port_open(80) {
-            "puerto 80 ocupado (no gestionado)".to_string()
-        } else {
-            "detenido".to_string()
-        },
-        mysql: if mysql_managed || port_open(3306) {
-            if mysql_managed {
-                "iniciado por el panel".to_string()
-            } else {
-                "puerto 3306 ocupado (no gestionado)".to_string()
-            }
+        data_path: state.data.display().to_string(),
+        mysql: if mysql_managed {
+            "iniciado por Xhamp Rust".to_string()
+        } else if port_open(mysql_port.unwrap_or(DEFAULT_MYSQL_PORT)) {
+            format!(
+                "puerto {} ocupado (servicio externo)",
+                mysql_port.unwrap_or(DEFAULT_MYSQL_PORT)
+            )
         } else {
             "detenido".to_string()
         },
@@ -244,9 +237,16 @@ async fn status(State(state): State<AppState>) -> ApiResult<Status> {
             "detenido".to_string()
         },
         selected_php,
-        installed_php: installed_versions(&state.data.join("runtimes").join("php")),
+        selected_mariadb,
+        installed_php,
+        installed_mariadb,
+        mysql_port: if mysql_managed { mysql_port } else { None },
         projects,
     }))
+}
+
+fn active_mysql_port(processes: &Arc<Mutex<Processes>>) -> Option<u16> {
+    processes.lock().ok()?.mysql_port
 }
 
 async fn catalog(State(state): State<AppState>) -> ApiResult<Catalog> {
@@ -337,33 +337,21 @@ async fn start_php(
         ));
     }
 
-    let php = selected_php_path(&state).unwrap_or_else(|| state.xampp.join("php").join("php.exe"));
-    if !php.is_file() {
-        return Err((
+    let php = selected_php_path(&state).ok_or_else(|| {
+        (
             StatusCode::NOT_FOUND,
-            "No encuentro php.exe. Configurá XAMPP_HOME o instalá una versión de PHP.".into(),
-        ));
-    }
-    let mut command = Command::new(&php);
-    if php.starts_with(state.data.join("runtimes").join("php")) {
-        command
-            .arg("-d")
-            .arg(format!(
-                "extension_dir={}",
-                php.parent().unwrap_or(Path::new(".")).join("ext").display()
-            ))
-            .arg("-d")
-            .arg("extension=mysqli")
-            .arg("-d")
-            .arg("extension=pdo_mysql");
-    }
+            "Primero descargá e instalá una versión de PHP desde el catálogo.".into(),
+        )
+    })?;
     let (stdout, stderr) = log_streams(&state.data, "php-server").map_err(|error| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("No se pudo abrir el log de PHP: {error}"),
         )
     })?;
-    let child = command
+    let child = Command::new(&php)
+        .arg("-c")
+        .arg(php.parent().unwrap_or(Path::new(".")).join("php.ini"))
         .arg("-S")
         .arg(format!("127.0.0.1:{}", request.port))
         .arg("-t")
@@ -430,107 +418,89 @@ async fn select_php(
     }))
 }
 
-async fn start_apache(State(state): State<AppState>) -> ApiResult<Message> {
-    if port_open(80) {
-        return Err((
-            StatusCode::CONFLICT,
-            "El puerto 80 ya está en uso. No voy a cerrar procesos ajenos.".into(),
-        ));
+async fn select_mariadb(
+    State(state): State<AppState>,
+    Json(request): Json<SelectMariaDb>,
+) -> ApiResult<Message> {
+    if !valid_version(&request.version) {
+        return Err((StatusCode::BAD_REQUEST, "Versión inválida.".into()));
     }
-    let apache = state.xampp.join("apache");
-    let executable = apache.join("bin").join("httpd.exe");
-    let config = apache.join("conf").join("httpd.conf");
-    if !executable.is_file() || !config.is_file() {
+    let runtime = state
+        .data
+        .join("runtimes")
+        .join("mariadb")
+        .join(&request.version);
+    if !runtime.join("bin").join("mariadb-install-db.exe").is_file()
+        && !runtime.join("bin").join("mysql_install_db.exe").is_file()
+    {
         return Err((
             StatusCode::NOT_FOUND,
-            "No encuentro Apache de XAMPP.".into(),
+            "Esa versión no está instalada o no incluye el inicializador para Windows.".into(),
         ));
     }
-    let (stdout, stderr) = log_streams(&state.data, "apache").map_err(|error| {
+    fs::write(state.data.join("selected-mariadb.txt"), request.version).map_err(|error| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
-            format!("No se pudo abrir el log de Apache: {error}"),
+            format!("No se pudo guardar la selección: {error}"),
         )
     })?;
-    let child = Command::new(executable)
-        .arg("-f")
-        .arg(config)
-        .current_dir(&apache)
-        .stdout(stdout)
-        .stderr(stderr)
-        .spawn()
-        .map_err(|error| {
-            (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("No se pudo iniciar Apache: {error}"),
-            )
-        })?;
-    set_process(&state.processes, "apache", child)?;
-    sleep(Duration::from_millis(300)).await;
-    if !process_running(&state.processes, "apache") {
-        return Err((
-            StatusCode::BAD_GATEWAY,
-            format!(
-                "Apache terminó al iniciar. Revisá {}.",
-                state.data.join("logs").join("apache.log").display()
-            ),
-        ));
-    }
     Ok(Json(Message {
-        message: "Apache está iniciando en el puerto 80.".into(),
+        message: "Versión de MariaDB seleccionada; usa una carpeta de datos aislada.".into(),
     }))
 }
 
-async fn stop_apache(State(state): State<AppState>) -> ApiResult<Message> {
-    let managed = process_running(&state.processes, "apache");
-    if !managed {
+async fn start_mysql(
+    State(state): State<AppState>,
+    Json(request): Json<StartMariaDb>,
+) -> ApiResult<Message> {
+    if !(1024..=65535).contains(&request.port) {
+        return Err((StatusCode::BAD_REQUEST, "Puerto inválido.".into()));
+    }
+    if port_open(request.port) {
         return Err((
             StatusCode::CONFLICT,
-            "El panel solo detiene el Apache que él mismo inició.".into(),
+            format!(
+                "El puerto {} ya está en uso. Elegí otro puerto para no interferir con XAMPP u otro servicio.",
+                request.port
+            ),
         ));
     }
-    let apache = state.xampp.join("apache");
-    let output = Command::new(apache.join("bin").join("httpd.exe"))
-        .arg("-k")
-        .arg("stop")
-        .arg("-f")
-        .arg(apache.join("conf").join("httpd.conf"))
-        .current_dir(apache)
-        .output()
-        .map_err(|error| {
+    if process_running(&state.processes, "mysql") {
+        return Err((
+            StatusCode::CONFLICT,
+            "MariaDB ya está iniciado; detenelo antes de cambiar de instancia.".into(),
+        ));
+    }
+    let version = selected_version(&state, "mariadb").ok_or_else(|| {
+        (
+            StatusCode::NOT_FOUND,
+            "Descargá e instalá una versión de MariaDB y seleccionala primero.".into(),
+        )
+    })?;
+    let runtime = state.data.join("runtimes").join("mariadb").join(&version);
+    let executable = ["mariadbd.exe", "mysqld.exe"]
+        .iter()
+        .map(|name| runtime.join("bin").join(name))
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
             (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("No se pudo detener Apache: {error}"),
+                StatusCode::NOT_FOUND,
+                "No encuentro el ejecutable del servidor MariaDB.".into(),
             )
         })?;
-    if !output.status.success() {
+    let data_dir = state.data.join("databases").join(&version);
+    fs::create_dir_all(&data_dir).map_err(api_error)?;
+    let config = data_dir.join("my.ini");
+    if !data_dir.join("mysql").is_dir() {
+        initialize_mariadb(&runtime, &data_dir, request.port).await?;
+    }
+    if !config.is_file() {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!(
-                "Apache no aceptó el apagado: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
+                "La base de datos no tiene configuración {}. No se modificaron sus archivos.",
+                config.display()
             ),
-        ));
-    }
-    stop_managed(&state.processes, "apache")?;
-    Ok(Json(Message {
-        message: "Se solicitó el apagado normal de Apache.".into(),
-    }))
-}
-
-async fn start_mysql(State(state): State<AppState>) -> ApiResult<Message> {
-    if port_open(3306) {
-        return Err((
-            StatusCode::CONFLICT,
-            "El puerto 3306 ya está en uso. No voy a cerrar procesos ajenos.".into(),
-        ));
-    }
-    let executable = state.xampp.join("mysql").join("bin").join("mysqld.exe");
-    let config = state.xampp.join("mysql").join("bin").join("my.ini");
-    if !executable.is_file() || !config.is_file() {
-        return Err((
-            StatusCode::NOT_FOUND,
-            "No encuentro MariaDB/MySQL y su configuración en XAMPP.".into(),
         ));
     }
     let (stdout, stderr) = log_streams(&state.data, "mysql").map_err(|error| {
@@ -541,30 +511,38 @@ async fn start_mysql(State(state): State<AppState>) -> ApiResult<Message> {
     })?;
     let child = Command::new(executable)
         .arg(format!("--defaults-file={}", config.display()))
-        .arg("--standalone")
-        .current_dir(&state.xampp)
+        .arg("--console")
+        .arg(format!("--port={}", request.port))
+        .arg("--bind-address=127.0.0.1")
+        .current_dir(&runtime)
         .stdout(stdout)
         .stderr(stderr)
         .spawn()
         .map_err(|error| {
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
-                format!("No se pudo iniciar MySQL/MariaDB: {error}"),
+                format!(
+                    "No se pudo iniciar MariaDB. Puede faltar Visual C++ Redistributable: {error}"
+                ),
             )
         })?;
     set_process(&state.processes, "mysql", child)?;
+    set_mysql_config(&state.processes, &runtime.join("bin"), request.port)?;
     sleep(Duration::from_millis(300)).await;
     if !process_running(&state.processes, "mysql") {
         return Err((
             StatusCode::BAD_GATEWAY,
             format!(
-                "MySQL/MariaDB terminó al iniciar. Revisá {}.",
+                "MariaDB terminó al iniciar. Revisá {}.",
                 state.data.join("logs").join("mysql.log").display()
             ),
         ));
     }
     Ok(Json(Message {
-        message: "MySQL/MariaDB está iniciando en el puerto 3306.".into(),
+        message: format!(
+            "MariaDB {} está disponible en 127.0.0.1:{} (base independiente).",
+            version, request.port
+        ),
     }))
 }
 
@@ -575,12 +553,29 @@ async fn stop_mysql(State(state): State<AppState>) -> ApiResult<Message> {
             "El panel solo detiene MySQL/MariaDB que él mismo inició.".into(),
         ));
     }
-    let mysqladmin = state.xampp.join("mysql").join("bin").join("mysqladmin.exe");
+    let (mysql_bin, port) = mysql_connection_settings(&state.processes).ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "El panel perdió la configuración de MariaDB activa.".into(),
+        )
+    })?;
+    let mysqladmin = ["mariadb-admin.exe", "mysqladmin.exe"]
+        .iter()
+        .map(|name| mysql_bin.join(name))
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                "No encuentro mariadb-admin.exe para apagar la base normalmente.".into(),
+            )
+        })?;
     let output = Command::new(mysqladmin)
+        .arg("--host=127.0.0.1")
+        .arg(format!("--port={port}"))
         .arg("-u")
         .arg("root")
         .arg("shutdown")
-        .current_dir(&state.xampp)
+        .current_dir(&mysql_bin)
         .output()
         .map_err(|error| {
             (
@@ -592,7 +587,7 @@ async fn stop_mysql(State(state): State<AppState>) -> ApiResult<Message> {
         return Err((
             StatusCode::INTERNAL_SERVER_ERROR,
             format!(
-                "MySQL no aceptó el apagado normal. Si root tiene contraseña, revisá el log de XAMPP. {}",
+                "MariaDB no aceptó el apagado normal. Revisá el log del servidor. {}",
                 String::from_utf8_lossy(&output.stderr).trim()
             ),
         ));
@@ -601,6 +596,92 @@ async fn stop_mysql(State(state): State<AppState>) -> ApiResult<Message> {
     Ok(Json(Message {
         message: "Se solicitó el apagado normal de MySQL/MariaDB.".into(),
     }))
+}
+
+async fn initialize_mariadb(runtime: &Path, data_dir: &Path, port: u16) -> ApiResult<()> {
+    let bin = runtime.join("bin");
+    let installer = ["mariadb-install-db.exe", "mysql_install_db.exe"]
+        .iter()
+        .map(|name| bin.join(name))
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+            (
+                StatusCode::NOT_FOUND,
+                "Este ZIP no contiene mariadb-install-db.exe; no se puede inicializar una base nueva.".into(),
+            )
+        })?;
+    let data_name = data_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "La carpeta de datos de MariaDB tiene un nombre inválido.".into(),
+            )
+        })?;
+    let config_template = data_dir
+        .parent()
+        .unwrap_or(data_dir)
+        .join(format!("{data_name}-xhamp-rust.ini"));
+    let basedir = runtime.to_string_lossy().replace('\\', "/");
+    let datadir = data_dir.to_string_lossy().replace('\\', "/");
+    let template = format!(
+        "[mysqld]\nbasedir=\"{basedir}\"\ndatadir=\"{datadir}\"\nport={port}\nbind-address=127.0.0.1\n"
+    );
+    fs::write(&config_template, template).map_err(api_error)?;
+    let installer_data = data_dir.to_path_buf();
+    let installer_config = config_template.clone();
+    let output = tokio::task::spawn_blocking(move || {
+        Command::new(installer)
+            .arg(format!("--datadir={}", installer_data.display()))
+            .arg(format!("--port={port}"))
+            .arg(format!("--config={}", installer_config.display()))
+            .arg("--silent")
+            .current_dir(bin)
+            .output()
+    })
+    .await
+    .map_err(api_error)?
+    .map_err(|error| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("No se pudo ejecutar el inicializador de MariaDB: {error}"),
+        )
+    })?;
+    if !output.status.success() || !data_dir.join("mysql").is_dir() {
+        let details = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let _ = fs::remove_file(&config_template);
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            format!(
+                "No se pudo inicializar la base vacía de MariaDB. No se borraron archivos. {} {} Revisá {}.",
+                details.trim(),
+                stdout.trim(),
+                data_dir.display()
+            ),
+        ));
+    }
+    let _ = fs::remove_file(config_template);
+    Ok(())
+}
+
+fn set_mysql_config(
+    processes: &Arc<Mutex<Processes>>,
+    mysql_bin: &Path,
+    port: u16,
+) -> Result<(), (StatusCode, String)> {
+    let mut processes = processes
+        .lock()
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Estado ocupado.".into()))?;
+    processes.mysql_bin = Some(mysql_bin.to_path_buf());
+    processes.mysql_port = Some(port);
+    Ok(())
+}
+
+fn mysql_connection_settings(processes: &Arc<Mutex<Processes>>) -> Option<(PathBuf, u16)> {
+    let processes = processes.lock().ok()?;
+    Some((processes.mysql_bin.clone()?, processes.mysql_port?))
 }
 
 async fn install_release(
@@ -727,8 +808,10 @@ async fn install_release(
     let executable = match kind.as_str() {
         "php" => staging.join("php.exe").is_file(),
         _ => {
-            staging.join("bin").join("mariadbd.exe").is_file()
-                || staging.join("bin").join("mysqld.exe").is_file()
+            (staging.join("bin").join("mariadbd.exe").is_file()
+                || staging.join("bin").join("mysqld.exe").is_file())
+                && (staging.join("bin").join("mariadb-install-db.exe").is_file()
+                    || staging.join("bin").join("mysql_install_db.exe").is_file())
         }
     };
     if !executable {
@@ -740,20 +823,68 @@ async fn install_release(
     tokio::fs::rename(&staging, &destination)
         .await
         .map_err(api_error)?;
+    if kind == "php" {
+        let php_root = destination.clone();
+        tokio::task::spawn_blocking(move || configure_php_runtime(&php_root))
+            .await
+            .map_err(api_error)?
+            .map_err(api_error)?;
+        let output = Command::new(destination.join("php.exe"))
+            .arg("-c")
+            .arg(destination.join("php.ini"))
+            .arg("--version")
+            .output()
+            .map_err(|error| {
+                api_error(format!(
+                    "PHP quedó descargado, pero Windows no pudo ejecutarlo. Instalá Microsoft Visual C++ Redistributable x64: {error}"
+                ))
+            })?;
+        if !output.status.success() {
+            return Err(api_error(format!(
+                "PHP quedó descargado, pero no pudo iniciarse. Puede faltar Microsoft Visual C++ Redistributable x64: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            )));
+        }
+    }
 
     Ok(Json(Message {
         message: if kind == "php" {
             format!(
-                "PHP {} quedó instalado en una carpeta aislada. Seleccionalo para usarlo.",
+                "PHP {} quedó instalado y configurado sin modificar XAMPP. Seleccionalo para usarlo.",
                 release.version
             )
         } else {
             format!(
-                "MariaDB {} quedó descargado y extraído, pero no se activó ni modificó la base existente.",
+                "MariaDB {} quedó instalado en una carpeta aislada. Seleccionalo y el panel creará una base nueva e independiente.",
                 release.version
             )
         },
     }))
+}
+
+fn configure_php_runtime(root: &Path) -> Result<(), String> {
+    let template = root.join("php.ini-development");
+    if !template.is_file() {
+        return Err("El paquete de PHP no contiene php.ini-development.".into());
+    }
+    let mut config = fs::read_to_string(&template).map_err(|error| error.to_string())?;
+    let extension_dir = root.join("ext").to_string_lossy().replace('\\', "/");
+    config.push_str(&format!(
+        "\n\n; Xhamp Rust local development defaults\nextension_dir = \"{extension_dir}\"\ndate.timezone = America/Argentina/Buenos_Aires\nlog_errors = On\n"
+    ));
+    for extension in [
+        "curl",
+        "fileinfo",
+        "mbstring",
+        "mysqli",
+        "openssl",
+        "pdo_mysql",
+        "sodium",
+        "zip",
+    ] {
+        config.push_str(&format!("extension={extension}\n"));
+    }
+    fs::write(root.join("php.ini"), config).map_err(|error| error.to_string())
 }
 
 async fn php_releases(client: &Client) -> Result<Vec<Release>, String> {
@@ -962,23 +1093,43 @@ fn normalize_mariadb_root(destination: &Path) -> Result<(), String> {
     fs::remove_dir(root).map_err(|error| error.to_string())
 }
 
-fn selected_php_path(state: &AppState) -> Option<PathBuf> {
-    let version = fs::read_to_string(state.data.join("selected-php.txt")).ok()?;
-    let version = version.trim();
-    if !valid_version(version) {
-        return None;
+fn selected_version(state: &AppState, kind: &str) -> Option<String> {
+    let root = state.data.join("runtimes").join(kind);
+    let versions = installed_versions(&root, kind);
+    let selected_file = state.data.join(format!("selected-{kind}.txt"));
+    if let Ok(selected) = fs::read_to_string(selected_file) {
+        let selected = selected.trim();
+        if valid_version(selected) && versions.iter().any(|version| version == selected) {
+            return Some(selected.to_string());
+        }
     }
-    let executable = state
-        .data
-        .join("runtimes")
-        .join("php")
-        .join(version)
-        .join("php.exe");
-    executable.is_file().then_some(executable)
+    versions.into_iter().last()
 }
 
-fn version_from_path(path: &Path) -> Option<String> {
-    path.parent()?.file_name()?.to_str().map(str::to_string)
+fn selected_php_path(state: &AppState) -> Option<PathBuf> {
+    Some(
+        state
+            .data
+            .join("runtimes")
+            .join("php")
+            .join(selected_version(state, "php")?)
+            .join("php.exe"),
+    )
+}
+
+fn version_cmp(left: &str, right: &str) -> std::cmp::Ordering {
+    let left_parts: Vec<_> = left.split(['.', '-']).collect();
+    let right_parts: Vec<_> = right.split(['.', '-']).collect();
+    for (left, right) in left_parts.iter().zip(right_parts.iter()) {
+        let ordering = match (left.parse::<u64>(), right.parse::<u64>()) {
+            (Ok(left), Ok(right)) => left.cmp(&right),
+            _ => left.cmp(right),
+        };
+        if ordering != std::cmp::Ordering::Equal {
+            return ordering;
+        }
+    }
+    left_parts.len().cmp(&right_parts.len())
 }
 
 fn valid_project_name(name: &str) -> bool {
@@ -1045,20 +1196,25 @@ fn process_running(processes: &Arc<Mutex<Processes>>, name: &str) -> bool {
     let Ok(mut processes) = processes.lock() else {
         return false;
     };
-    let process = match name {
-        "apache" => &mut processes.apache,
-        "mysql" => &mut processes.mysql,
-        _ => &mut processes.php,
+    let is_mysql = name == "mysql";
+    let status = if is_mysql {
+        processes.mysql.as_mut().map(Child::try_wait)
+    } else {
+        processes.php.as_mut().map(Child::try_wait)
     };
-    match process {
-        Some(child) => match child.try_wait() {
-            Ok(Some(_)) => {
-                *process = None;
-                false
+    match status {
+        Some(Ok(Some(_))) => {
+            if is_mysql {
+                processes.mysql = None;
+                processes.mysql_bin = None;
+                processes.mysql_port = None;
+            } else {
+                processes.php = None;
             }
-            Ok(None) => true,
-            Err(_) => false,
-        },
+            false
+        }
+        Some(Ok(None)) => true,
+        Some(Err(_)) => false,
         None => false,
     }
 }
@@ -1071,10 +1227,10 @@ fn set_process(
     let mut processes = processes
         .lock()
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Estado ocupado.".into()))?;
-    let slot = match name {
-        "apache" => &mut processes.apache,
-        "mysql" => &mut processes.mysql,
-        _ => &mut processes.php,
+    let slot = if name == "mysql" {
+        &mut processes.mysql
+    } else {
+        &mut processes.php
     };
     if slot.is_some() {
         let mut child = child;
@@ -1093,18 +1249,29 @@ fn stop_managed(processes: &Arc<Mutex<Processes>>, name: &str) -> Result<(), (St
     let mut processes = processes
         .lock()
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Estado ocupado.".into()))?;
-    let process = match name {
-        "apache" => &mut processes.apache,
-        "mysql" => &mut processes.mysql,
-        _ => &mut processes.php,
+    let is_mysql = name == "mysql";
+    let mut child = if is_mysql {
+        processes.mysql.take()
+    } else {
+        processes.php.take()
     };
-    if let Some(mut child) = process.take() {
+    if let Some(mut child) = child.take() {
         for _ in 0..30 {
             match child.try_wait() {
-                Ok(Some(_)) => return Ok(()),
+                Ok(Some(_)) => {
+                    if is_mysql {
+                        processes.mysql_bin = None;
+                        processes.mysql_port = None;
+                    }
+                    return Ok(());
+                }
                 Ok(None) => std::thread::sleep(Duration::from_millis(100)),
                 Err(error) => {
-                    *process = Some(child);
+                    if is_mysql {
+                        processes.mysql = Some(child);
+                    } else {
+                        processes.php = Some(child);
+                    }
                     return Err((
                         StatusCode::INTERNAL_SERVER_ERROR,
                         format!("No se pudo verificar el apagado: {error}"),
@@ -1112,7 +1279,11 @@ fn stop_managed(processes: &Arc<Mutex<Processes>>, name: &str) -> Result<(), (St
                 }
             }
         }
-        *process = Some(child);
+        if is_mysql {
+            processes.mysql = Some(child);
+        } else {
+            processes.php = Some(child);
+        }
         return Err((
             StatusCode::GATEWAY_TIMEOUT,
             format!("{name} sigue activo; no se forzó su cierre."),
@@ -1145,7 +1316,7 @@ fn open_browser(url: &str) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{valid_project_name, valid_version};
+    use super::{valid_project_name, valid_version, version_cmp};
 
     #[test]
     fn project_names_are_limited_to_safe_directory_names() {
@@ -1160,6 +1331,13 @@ mod tests {
         assert!(valid_version("8.4.27-1"));
         assert!(!valid_version("../8.4"));
         assert!(!valid_version("8.4\\php.exe"));
+    }
+
+    #[test]
+    fn versions_are_sorted_numerically_not_lexically() {
+        assert!(version_cmp("8.10.0", "8.9.9").is_gt());
+        assert!(version_cmp("11.8.9", "10.11.20").is_gt());
+        assert!(version_cmp("8.4.27-1", "8.4.27-2").is_lt());
     }
 
     #[test]
