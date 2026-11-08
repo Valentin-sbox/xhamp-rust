@@ -1,0 +1,47 @@
+name: Build Windows portable app
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Run tests
+        run: cargo test --locked
+
+      - name: Build Windows executable
+        run: cargo build --release --locked
+
+      - name: Prepare portable package
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Copy-Item target/release/xhamp-rust.exe dist/XhampRust.exe
+          Copy-Item README.md dist/README.txt
+          Compress-Archive -Path dist/XhampRust.exe,dist/README.txt -DestinationPath XhampRust-windows-x64.zip -Force
+
+      - name: Upload portable package
+        uses: actions/upload-artifact@v4
+        with:
+          name: XhampRust-windows-x64
+          path: XhampRust-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 30
