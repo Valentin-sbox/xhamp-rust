@@ -4,13 +4,11 @@ Panel portable para tener tu propio entorno PHP y MariaDB en Windows, independie
 
 ## Usar la app portable
 
-1. En GitHub, entra en **Actions** y selecciona **Build Windows portable app**.
-2. Presiona **Run workflow** en `main`.
-3. Al terminar el build, descarga el artefacto `XhampRust-windows-x64`.
-4. Extrae el ZIP y ejecuta `XhampRust.exe`.
-5. Se abre el panel en `http://127.0.0.1:8765`. Deja abierto el programa mientras uses los servicios.
+1. Para probar una compilación, entra en **Actions**, selecciona **Build Windows portable app** y presiona **Run workflow** en `main`. Al terminar, descarga el artefacto `XhampRust-windows-x64`.
+2. Para publicar una beta, crea y sube un tag, por ejemplo `v0.1.0-beta.1`. Actions compila para Windows x64 y adjunta `XhampRust-windows-x64.zip` y su archivo `.sha256` a **Releases**; los tags con guion se marcan como pre-release.
+3. En Windows 10/11 x64, extrae el ZIP y ejecuta `XhampRust.exe`. Se abre el panel en `http://127.0.0.1:8765`. Deja abierto el programa mientras uses los servicios.
 
-Para obtener el `.exe` en GitHub Codespaces, usa el workflow de Actions: Codespaces usa Linux y no produce un ejecutable de Windows. El ZIP portable contiene la aplicación; PHP y MariaDB se descargan desde sus catálogos oficiales dentro del panel cuando los necesites.
+Para obtener el `.exe` de Windows desde GitHub Codespaces, usa el workflow de Actions: Codespaces usa Linux y no produce un ejecutable de Windows. El ZIP portable contiene la aplicación; PHP y MariaDB se descargan desde sus catálogos oficiales dentro del panel cuando los necesites. La publicación está preparada para Windows x64, no para todas las arquitecturas o versiones de Windows.
 
 ## Primer uso
 

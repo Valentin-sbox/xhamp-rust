@@ -598,7 +598,11 @@ async fn stop_mysql(State(state): State<AppState>) -> ApiResult<Message> {
     }))
 }
 
-async fn initialize_mariadb(runtime: &Path, data_dir: &Path, port: u16) -> ApiResult<()> {
+async fn initialize_mariadb(
+    runtime: &Path,
+    data_dir: &Path,
+    port: u16,
+) -> Result<(), (StatusCode, String)> {
     let bin = runtime.join("bin");
     let installer = ["mariadb-install-db.exe", "mysql_install_db.exe"]
         .iter()
