@@ -1166,7 +1166,9 @@ mod tests {
     fn generated_php_project_has_a_valid_safe_project_name() {
         let project_name = "mi_sitio-2";
         let template = include_str!("../static/project-index.php");
-        let generated = template.replace("__PROJECT_NAME__", project_name);
+        let generated = template
+            .replace("__PROJECT_NAME__", project_name)
+            .replace("\r\n", "\n");
 
         assert!(generated.starts_with("<?php\n$projectName = 'mi_sitio-2';"));
         assert!(!generated.contains("__PROJECT_NAME__"));
