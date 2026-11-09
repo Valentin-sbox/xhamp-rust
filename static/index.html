@@ -22,6 +22,8 @@
     .status { line-height: 1.8; overflow-wrap: anywhere; }
     .message { min-height: 1.5em; color: #a9d8a4; }
     .warning { color: #f1c57b; }
+    .console { max-height: 280px; min-height: 120px; overflow: auto; padding: 12px; background: #0b0f13; border: 1px solid #2d3947; border-radius: 6px; color: #c8e3cc; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .preview { width: 100%; height: 520px; border: 1px solid #44566a; border-radius: 6px; background: #fff; }
     a { color: #8bc7ff; }
     code { color: #a9d8a4; }
   </style>
@@ -36,12 +38,12 @@
       <div id="status" class="status">Cargando estado…</div>
       <div class="row">
         <button id="start-php" class="primary">Iniciar sitio PHP</button>
-        <button id="stop-php">Detener sitio</button>
+        <button id="stop-php" hidden>Detener sitio</button>
       </div>
       <div class="row">
         <input id="mysql-port" type="number" value="3307" min="1024" max="65535" aria-label="Puerto de MariaDB">
         <button id="start-mysql" class="primary">Iniciar MariaDB</button>
-        <button id="stop-mysql">Detener MariaDB</button>
+        <button id="stop-mysql" hidden>Detener MariaDB</button>
       </div>
       <p class="muted">Base local: <code>127.0.0.1</code>. El puerto 3307 evita chocar con tu XAMPP, que suele usar 3306.</p>
       <p class="muted">MariaDB local usa el usuario <code>root</code> sin contraseña, como una instalación XAMPP de desarrollo. No expongas este servidor a internet.</p>
@@ -55,11 +57,23 @@
       <div class="row">
         <select id="project-list" aria-label="Proyecto"></select>
         <input id="php-port" type="number" value="8080" min="1024" max="65535" aria-label="Puerto">
-        <button id="open-project">Abrir en localhost</button>
+        <button id="open-project">Mostrar sitio</button>
       </div>
       <p class="muted">El servidor PHP de desarrollo escucha solo en <code>127.0.0.1</code>.</p>
+      <h3>Importar sitios de XAMPP</h3>
+      <div class="row">
+        <input id="xampp-path" placeholder="C:\xampp" aria-label="Carpeta de XAMPP">
+        <button id="detect-xampp">Detectar</button>
+        <button id="browse-xampp">Buscar carpeta</button>
+        <button id="import-xampp" class="primary">Importar sitios</button>
+      </div>
+      <p class="muted">Copia los sitios desde htdocs sin sobrescribir proyectos. Las bases se migran aparte con exportación SQL.</p>
     </section>
   </div>
+  <section>
+    <h2>Vista del sitio</h2>
+    <iframe id="preview" class="preview" title="Vista previa del sitio PHP" src="about:blank"></iframe>
+  </section>
   <section>
     <h2>Versiones oficiales</h2>
     <p class="muted">Las descargas se verifican con SHA-256. Cada versión y cada base de datos quedan aisladas; XAMPP no se modifica.</p>
@@ -83,13 +97,21 @@
       </div>
     </div>
     <button id="refresh-catalog">Actualizar catálogo</button>
+    <p id="version-status" class="muted">Consultando versiones oficiales…</p>
     <p class="muted">PHP: <a href="https://windows.php.net/download/" target="_blank" rel="noreferrer">Windows.php.net</a> · MariaDB: <a href="https://mariadb.org/download/" target="_blank" rel="noreferrer">MariaDB.org</a></p>
     <p class="warning">Este programa ya no usa Apache ni los ejecutables o datos de XAMPP: sirve PHP con el servidor local de PHP y administra su propio MariaDB.</p>
+  </section>
+  <section>
+    <h2>Consola</h2>
+    <pre id="console-logs" class="console">Esperando registros…</pre>
   </section>
   <script>
     const message = document.querySelector("#message");
     let installedPhp = [];
     let installedMariaDb = [];
+    let latestPhp = "";
+    let latestMariaDb = "";
+    let currentStatus = null;
     async function api(url, body) {
       const options = body === undefined ? {} : {
         method: "POST",
@@ -107,20 +129,24 @@
       if (!response.ok) throw new Error(result.message || "La operación falló.");
       return result;
     }
-    async function run(action) {
+    async function run(action, buttons = []) {
+      buttons.forEach(button => { button.disabled = true; });
       try {
         const result = await action();
         message.textContent = result.message || "Listo.";
         message.className = "message";
-        await refreshStatus();
       } catch (error) {
         message.textContent = error.message;
         message.className = "message warning";
+      } finally {
+        buttons.forEach(button => { button.disabled = false; });
+        await refreshStatus();
       }
     }
     async function refreshStatus() {
       try {
         const status = await api("/api/status");
+        currentStatus = status;
         installedPhp = status.installed_php;
         installedMariaDb = status.installed_mariadb;
         document.querySelector("#mysql-port").value = status.mysql_port || document.querySelector("#mysql-port").value || 3307;
@@ -147,6 +173,13 @@
           div.textContent = line;
           panel.append(div);
         }
+        document.querySelector("#start-php").hidden = status.php_running;
+        document.querySelector("#stop-php").hidden = !status.php_running;
+        document.querySelector("#start-mysql").hidden = status.mysql_managed;
+        document.querySelector("#stop-mysql").hidden = !status.mysql_managed;
+        document.querySelector("#start-mysql").disabled = status.mysql_external;
+        if (status.php_port) document.querySelector("#php-port").value = status.php_port;
+        updateVersionStatus();
       } catch (error) {
         message.textContent = error.message;
         message.className = "message warning";
@@ -155,6 +188,8 @@
     async function refreshCatalog() {
       await run(async () => {
         const catalog = await api("/api/catalog");
+        latestPhp = catalog.php[0]?.version || "";
+        latestMariaDb = catalog.mariadb[0]?.version || "";
         const phpReleases = [...catalog.php];
         for (const version of installedPhp) {
           if (!phpReleases.some(release => release.version === version)) {
@@ -177,35 +212,85 @@
             select.append(option);
           }
         }
+        updateVersionStatus();
         return { message: "Catálogos oficiales actualizados." };
       });
     }
+    function updateVersionStatus() {
+      if (!currentStatus) return;
+      const compare = new Intl.Collator("en", { numeric: true }).compare;
+      const phpNeedsUpdate = latestPhp && currentStatus.selected_php !== "Ninguna" && compare(latestPhp, currentStatus.selected_php) > 0;
+      const dbNeedsUpdate = latestMariaDb && currentStatus.selected_mariadb !== "Ninguna" && compare(latestMariaDb, currentStatus.selected_mariadb) > 0;
+      document.querySelector("#version-status").textContent = [
+        `PHP instalado: ${installedPhp.join(", ") || "ninguno"}. Último oficial: ${latestPhp || "no consultado"}${phpNeedsUpdate ? " (hay actualización)" : ""}.`,
+        `MariaDB instalado: ${installedMariaDb.join(", ") || "ninguno"}. Último oficial: ${latestMariaDb || "no consultado"}${dbNeedsUpdate ? " (hay actualización)" : ""}.`
+      ].join(" ");
+    }
+    async function refreshLogs() {
+      try {
+        const logs = await api("/api/logs");
+        const consoleView = document.querySelector("#console-logs");
+        const text = [`[PHP]\n${logs.php || "(sin registros)"}`, `[MariaDB]\n${logs.mariadb || "(sin registros)"}`].join("\n\n");
+        if (consoleView.textContent !== text) {
+          const atBottom = consoleView.scrollTop + consoleView.clientHeight >= consoleView.scrollHeight - 8;
+          consoleView.textContent = text;
+          if (atBottom) consoleView.scrollTop = consoleView.scrollHeight;
+        }
+      } catch (error) {
+        document.querySelector("#console-logs").textContent = error.message;
+      }
+    }
+    async function detectXampp() {
+      await run(async () => {
+        const result = await api("/api/xampp/detect");
+        if (result.paths.length) {
+          document.querySelector("#xampp-path").value = result.paths[0];
+          return { message: `XAMPP detectado en ${result.paths[0]}.` };
+        }
+        return { message: "No se detectó XAMPP en las rutas habituales. Usa Buscar carpeta." };
+      }, [document.querySelector("#detect-xampp")]);
+    }
+    async function browseXampp() {
+      await run(async () => {
+        const result = await api("/api/xampp/browse");
+        if (result.path) document.querySelector("#xampp-path").value = result.path;
+        return { message: result.path ? `Carpeta seleccionada: ${result.path}` : "Selección cancelada." };
+      }, [document.querySelector("#browse-xampp")]);
+    }
+    async function importXampp() {
+      await run(async () => {
+        const result = await api("/api/xampp/import", { path: document.querySelector("#xampp-path").value.trim() });
+        return { message: `Sitios importados: ${result.imported}. Omitidos por nombre no compatible o destino existente: ${result.skipped}.` };
+      }, [document.querySelector("#import-xampp")]);
+    }
+    async function startSelectedPhp() {
+      const project = document.querySelector("#project-list").value;
+      if (!project) throw new Error("Crea o selecciona un proyecto primero.");
+      const port = Number(document.querySelector("#php-port").value);
+      const result = await api("/api/php/start", { project, port });
+      document.querySelector("#preview").src = `http://127.0.0.1:${port}`;
+      return result;
+    }
+    async function showSelectedPhp() {
+      if (currentStatus?.php_running && currentStatus.php_port) {
+        document.querySelector("#preview").src = `http://127.0.0.1:${currentStatus.php_port}`;
+        return { message: `Mostrando ${currentStatus.php_project || "el sitio activo"} dentro de Xhamp Rust.` };
+      }
+      return startSelectedPhp();
+    }
+    document.querySelector("#detect-xampp").addEventListener("click", detectXampp);
+    document.querySelector("#browse-xampp").addEventListener("click", browseXampp);
+    document.querySelector("#import-xampp").addEventListener("click", importXampp);
     document.querySelector("#create-project").addEventListener("click", () => run(() =>
       api("/api/projects", { name: document.querySelector("#project-name").value.trim() })
     ));
-    document.querySelector("#open-project").addEventListener("click", () => {
-      const port = Number(document.querySelector("#php-port").value);
-      const tab = window.open("about:blank", "_blank");
-      run(async () => {
-        try {
-          const project = document.querySelector("#project-list").value;
-          const result = await api("/api/php/start", { project, port });
-          if (tab) tab.location.replace(`http://127.0.0.1:${port}`);
-          return result;
-        } catch (error) {
-          if (tab) tab.close();
-          throw error;
-        }
-      });
-    });
-    document.querySelector("#stop-php").addEventListener("click", () => run(() => api("/api/php/stop", {})));
-    document.querySelector("#start-php").addEventListener("click", () => {
-      document.querySelector("#open-project").click();
-    });
+    document.querySelector("#open-project").addEventListener("click", () => run(showSelectedPhp, [document.querySelector("#open-project")]));
+    document.querySelector("#stop-php").addEventListener("click", () => run(() => api("/api/php/stop", {}), [document.querySelector("#stop-php")]));
+    document.querySelector("#start-php").addEventListener("click", () => run(startSelectedPhp, [document.querySelector("#start-php")]));
+    document.querySelector("#stop-mysql").addEventListener("click", () => run(() => api("/api/mysql/stop", {}), [document.querySelector("#stop-mysql")]));
     document.querySelector("#start-mysql").addEventListener("click", () => run(() =>
       api("/api/mysql/start", { port: Number(document.querySelector("#mysql-port").value) })
-    ));
-    document.querySelector("#stop-mysql").addEventListener("click", () => run(() => api("/api/mysql/stop", {})));
+    , [document.querySelector("#start-mysql")]));
     document.querySelector("#install-php").addEventListener("click", () => run(() =>
       api("/api/install", { kind: "php", version: document.querySelector("#php-catalog").value })
     ));
@@ -220,8 +305,10 @@
     ));
     document.querySelector("#refresh-catalog").addEventListener("click", refreshCatalog);
     refreshStatus();
+    refreshLogs();
     refreshCatalog();
     setInterval(refreshStatus, 5000);
+    setInterval(refreshLogs, 3000);
   </script>
 </body>
 </html>

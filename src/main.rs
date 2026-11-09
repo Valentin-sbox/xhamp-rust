@@ -1,3 +1,5 @@
+#![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
+
 use axum::{
     extract::{Path as AxumPath, Request, State},
     http::StatusCode,
@@ -14,7 +16,7 @@ use std::{
     collections::BTreeMap,
     env,
     fs::{self, File, OpenOptions},
-    io::{self, Read},
+    io::{self, Read, Seek, SeekFrom},
     net::{SocketAddr, TcpStream},
     path::{Component, Path, PathBuf},
     process::{Child, Command, Stdio},
@@ -70,6 +72,8 @@ struct Processes {
     mysql_bin: Option<PathBuf>,
     mysql_port: Option<u16>,
     php: Option<Child>,
+    php_port: Option<u16>,
+    php_project: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -77,11 +81,16 @@ struct Status {
     data_path: String,
     mysql: String,
     php: String,
+    mysql_managed: bool,
+    mysql_external: bool,
+    php_running: bool,
     selected_php: String,
     selected_mariadb: String,
     installed_php: Vec<String>,
     installed_mariadb: Vec<String>,
     mysql_port: Option<u16>,
+    php_port: Option<u16>,
+    php_project: Option<String>,
     projects: Vec<String>,
 }
 
@@ -96,6 +105,33 @@ struct Release {
 struct Catalog {
     php: Vec<Release>,
     mariadb: Vec<Release>,
+}
+
+#[derive(Serialize)]
+struct Logs {
+    php: String,
+    mariadb: String,
+}
+
+#[derive(Serialize)]
+struct XamppFolder {
+    path: String,
+}
+
+#[derive(Deserialize)]
+struct ImportXampp {
+    path: String,
+}
+
+#[derive(Serialize)]
+struct ImportResult {
+    imported: usize,
+    skipped: usize,
+}
+
+#[derive(Serialize)]
+struct XamppCandidates {
+    paths: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -143,7 +179,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map(PathBuf::from)
         .unwrap_or_else(env::temp_dir)
         .join("XhampRust");
-    fs::create_dir_all(data.join("projects"))?;
+    fs::create_dir_all(data.join("htdocs"))?;
+    migrate_legacy_projects(&data)?;
     fs::create_dir_all(data.join("downloads"))?;
     fs::create_dir_all(data.join("runtimes").join("php"))?;
     fs::create_dir_all(data.join("runtimes").join("mariadb"))?;
@@ -163,7 +200,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let app = Router::new()
         .route("/", get(index))
         .route("/api/status", get(status))
+        .route("/api/logs", get(logs))
         .route("/api/catalog", get(catalog))
+        .route("/api/xampp/detect", get(detect_xampp))
+        .route("/api/xampp/browse", get(browse_xampp))
+        .route("/api/xampp/import", post(import_xampp))
         .route("/api/projects", post(create_project))
         .route("/api/php/start", post(start_php))
         .route("/api/php/stop", post(stop_php))
@@ -178,11 +219,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let listener = tokio::net::TcpListener::bind(PANEL_ADDRESS).await?;
     let panel_url = format!("http://{PANEL_ADDRESS}");
-    println!("Xhamp Rust está listo en {panel_url}");
-    if let Err(error) = open_browser(&panel_url) {
-        eprintln!("No pude abrir el navegador automáticamente: {error}");
+    #[cfg(target_os = "windows")]
+    {
+        tokio::spawn(async move {
+            if let Err(error) = axum::serve(listener, app).await {
+                eprintln!("El servidor local terminó: {error}");
+            }
+        });
+        let desktop_result = run_desktop(&panel_url);
+        if let Err(error) = &desktop_result {
+            let _ = rfd::MessageDialog::new()
+                .set_title("No se pudo abrir Xhamp Rust")
+                .set_description(format!(
+                    "Microsoft Edge WebView2 Runtime debe estar instalado para abrir la app. Error: {error}"
+                ))
+                .set_level(rfd::MessageLevel::Error)
+                .show();
+        }
+        let _ = stop_php(State(state.clone())).await;
+        if stop_mysql(State(state.clone())).await.is_err() {
+            let _ = terminate_managed(&state.processes, "mysql");
+        }
+        desktop_result?;
     }
-    axum::serve(listener, app).await?;
+    #[cfg(not(target_os = "windows"))]
+    {
+        println!("Xhamp Rust está listo en {panel_url}");
+        if let Err(error) = open_browser(&panel_url) {
+            eprintln!("No pude abrir el navegador automáticamente: {error}");
+        }
+        axum::serve(listener, app).await?;
+    }
     Ok(())
 }
 
@@ -210,7 +277,7 @@ async fn validate_host(request: Request, next: Next) -> Response {
 async fn status(State(state): State<AppState>) -> ApiResult<Status> {
     let mysql_managed = process_running(&state.processes, "mysql");
     let php_running = process_running(&state.processes, "php");
-    let projects = list_projects(&state.data.join("projects"));
+    let projects = list_projects(&state.data.join("htdocs"));
     let installed_php = installed_versions(&state.data.join("runtimes").join("php"), "php");
     let installed_mariadb =
         installed_versions(&state.data.join("runtimes").join("mariadb"), "mariadb");
@@ -218,6 +285,12 @@ async fn status(State(state): State<AppState>) -> ApiResult<Status> {
     let selected_mariadb =
         selected_version(&state, "mariadb").unwrap_or_else(|| "Ninguna".to_string());
     let mysql_port = active_mysql_port(&state.processes);
+    let (php_port, php_project) = state
+        .processes
+        .lock()
+        .map(|processes| (processes.php_port, processes.php_project.clone()))
+        .unwrap_or_default();
+    let mysql_external = !mysql_managed && port_open(DEFAULT_MYSQL_PORT);
 
     Ok(Json(Status {
         data_path: state.data.display().to_string(),
@@ -236,11 +309,16 @@ async fn status(State(state): State<AppState>) -> ApiResult<Status> {
         } else {
             "detenido".to_string()
         },
+        mysql_managed,
+        mysql_external,
+        php_running,
         selected_php,
         selected_mariadb,
         installed_php,
         installed_mariadb,
         mysql_port: if mysql_managed { mysql_port } else { None },
+        php_port: if php_running { php_port } else { None },
+        php_project: if php_running { php_project } else { None },
         projects,
     }))
 }
@@ -255,6 +333,97 @@ async fn catalog(State(state): State<AppState>) -> ApiResult<Catalog> {
     Ok(Json(Catalog { php, mariadb }))
 }
 
+async fn logs(State(state): State<AppState>) -> ApiResult<Logs> {
+    Ok(Json(Logs {
+        php: read_log_tail(&state.data.join("logs").join("php-server.log"), 32 * 1024),
+        mariadb: read_log_tail(&state.data.join("logs").join("mysql.log"), 32 * 1024),
+    }))
+}
+
+async fn detect_xampp() -> ApiResult<XamppCandidates> {
+    let paths = known_xampp_paths()
+        .into_iter()
+        .filter(|path| path.join("htdocs").is_dir())
+        .map(|path| path.display().to_string())
+        .collect();
+    Ok(Json(XamppCandidates { paths }))
+}
+
+#[cfg(target_os = "windows")]
+async fn browse_xampp() -> ApiResult<XamppFolder> {
+    let path = tokio::task::spawn_blocking(|| {
+        rfd::FileDialog::new()
+            .set_title("Seleccionar carpeta de XAMPP")
+            .pick_folder()
+    })
+    .await
+    .map_err(api_error)?
+    .map(|path| path.display().to_string())
+    .unwrap_or_default();
+    Ok(Json(XamppFolder { path }))
+}
+
+#[cfg(not(target_os = "windows"))]
+async fn browse_xampp() -> ApiResult<XamppFolder> {
+    Err((
+        StatusCode::NOT_IMPLEMENTED,
+        "El selector de carpetas está disponible en Windows.".into(),
+    ))
+}
+
+async fn import_xampp(
+    State(state): State<AppState>,
+    Json(request): Json<ImportXampp>,
+) -> ApiResult<ImportResult> {
+    let selected = PathBuf::from(request.path.trim());
+    let htdocs = if selected
+        .file_name()
+        .is_some_and(|name| name.eq_ignore_ascii_case("htdocs"))
+    {
+        selected
+    } else {
+        selected.join("htdocs")
+    };
+    if !htdocs.is_dir() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            "No encuentro una carpeta htdocs dentro de la ruta elegida.".into(),
+        ));
+    }
+
+    let destination_root = state.data.join("htdocs");
+    let mut imported = 0;
+    let mut skipped = 0;
+    for entry in fs::read_dir(&htdocs).map_err(api_error)? {
+        let entry = entry.map_err(api_error)?;
+        let file_type = entry.file_type().map_err(api_error)?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            skipped += 1;
+            continue;
+        };
+        if !file_type.is_dir() || !valid_project_name(name) {
+            skipped += 1;
+            continue;
+        }
+        let destination = destination_root.join(name);
+        if destination.exists() {
+            skipped += 1;
+            continue;
+        }
+        if let Err(error) = copy_directory(&entry.path(), &destination) {
+            let _ = fs::remove_dir_all(&destination);
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("No se pudo importar {name}: {error}"),
+            ));
+        }
+        imported += 1;
+    }
+
+    Ok(Json(ImportResult { imported, skipped }))
+}
+
 async fn create_project(
     State(state): State<AppState>,
     Json(request): Json<NewProject>,
@@ -266,7 +435,7 @@ async fn create_project(
         ));
     }
 
-    let path = state.data.join("projects").join(&request.name);
+    let path = state.data.join("htdocs").join(&request.name);
     fs::create_dir(&path).map_err(|error| {
         let status = if error.kind() == io::ErrorKind::AlreadyExists {
             StatusCode::CONFLICT
@@ -298,7 +467,7 @@ async fn project_details(
             "Nombre de proyecto inválido.".into(),
         ));
     }
-    let path = state.data.join("projects").join(name);
+    let path = state.data.join("htdocs").join(name);
     if !path.is_dir() {
         return Err((StatusCode::NOT_FOUND, "No existe ese proyecto.".into()));
     }
@@ -323,7 +492,7 @@ async fn start_php(
             "Ya hay un servidor PHP iniciado por el panel; detenelo antes de abrir otro.".into(),
         ));
     }
-    let project = state.data.join("projects").join(&request.project);
+    let project = state.data.join("htdocs").join(&request.project);
     if !project.is_dir() {
         return Err((
             StatusCode::NOT_FOUND,
@@ -367,6 +536,7 @@ async fn start_php(
             )
         })?;
     set_process(&state.processes, "php", child)?;
+    set_php_settings(&state.processes, &request.project, request.port)?;
     sleep(Duration::from_millis(300)).await;
     if !process_running(&state.processes, "php") {
         return Err((
@@ -680,6 +850,19 @@ fn set_mysql_config(
         .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Estado ocupado.".into()))?;
     processes.mysql_bin = Some(mysql_bin.to_path_buf());
     processes.mysql_port = Some(port);
+    Ok(())
+}
+
+fn set_php_settings(
+    processes: &Arc<Mutex<Processes>>,
+    project: &str,
+    port: u16,
+) -> Result<(), (StatusCode, String)> {
+    let mut processes = processes
+        .lock()
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Estado ocupado.".into()))?;
+    processes.php_project = Some(project.to_string());
+    processes.php_port = Some(port);
     Ok(())
 }
 
@@ -1152,6 +1335,52 @@ fn valid_version(version: &str) -> bool {
             .all(|character| character.is_ascii_digit() || matches!(character, '.' | '-'))
 }
 
+fn known_xampp_paths() -> Vec<PathBuf> {
+    let mut paths = vec![PathBuf::from(r"C:\xampp"), PathBuf::from(r"D:\xampp")];
+    for variable in ["ProgramFiles", "ProgramFiles(x86)"] {
+        if let Some(root) = env::var_os(variable) {
+            paths.push(PathBuf::from(root).join("xampp"));
+        }
+    }
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn migrate_legacy_projects(data: &Path) -> io::Result<()> {
+    let legacy = data.join("projects");
+    let destination = data.join("htdocs");
+    if !legacy.is_dir() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(legacy)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let target = destination.join(entry.file_name());
+        if !target.exists() {
+            copy_directory(&entry.path(), &target)?;
+        }
+    }
+    Ok(())
+}
+
+fn copy_directory(source: &Path, destination: &Path) -> io::Result<()> {
+    fs::create_dir(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let file_type = entry.file_type()?;
+        let target = destination.join(entry.file_name());
+        if file_type.is_dir() {
+            copy_directory(&entry.path(), &target)?;
+        } else if file_type.is_file() {
+            fs::copy(entry.path(), target)?;
+        }
+    }
+    Ok(())
+}
+
 fn list_projects(root: &Path) -> Vec<String> {
     let Ok(entries) = fs::read_dir(root) else {
         return Vec::new();
@@ -1188,6 +1417,24 @@ fn log_streams(data: &Path, name: &str) -> io::Result<(Stdio, Stdio)> {
     Ok((stdout, stderr))
 }
 
+fn read_log_tail(path: &Path, max_bytes: usize) -> String {
+    let Ok(mut file) = File::open(path) else {
+        return String::new();
+    };
+    let Ok(length) = file.metadata().map(|metadata| metadata.len()) else {
+        return String::new();
+    };
+    let offset = length.saturating_sub(max_bytes as u64);
+    if file.seek(SeekFrom::Start(offset)).is_err() {
+        return String::new();
+    }
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
+        return String::new();
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
 fn port_open(port: u16) -> bool {
     TcpStream::connect_timeout(
         &SocketAddr::from(([127, 0, 0, 1], port)),
@@ -1214,6 +1461,8 @@ fn process_running(processes: &Arc<Mutex<Processes>>, name: &str) -> bool {
                 processes.mysql_port = None;
             } else {
                 processes.php = None;
+                processes.php_port = None;
+                processes.php_project = None;
             }
             false
         }
@@ -1260,12 +1509,38 @@ fn stop_managed(processes: &Arc<Mutex<Processes>>, name: &str) -> Result<(), (St
         processes.php.take()
     };
     if let Some(mut child) = child.take() {
+        if !is_mysql {
+            if let Err(error) = child.kill() {
+                if child.try_wait().ok().flatten().is_some() {
+                    processes.php_port = None;
+                    processes.php_project = None;
+                    return Ok(());
+                }
+                processes.php = Some(child);
+                return Err((
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("No se pudo detener el servidor PHP: {error}"),
+                ));
+            }
+            child.wait().map_err(|error| {
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("No se pudo confirmar el cierre de PHP: {error}"),
+                )
+            })?;
+            processes.php_port = None;
+            processes.php_project = None;
+            return Ok(());
+        }
         for _ in 0..30 {
             match child.try_wait() {
                 Ok(Some(_)) => {
                     if is_mysql {
                         processes.mysql_bin = None;
                         processes.mysql_port = None;
+                    } else {
+                        processes.php_port = None;
+                        processes.php_project = None;
                     }
                     return Ok(());
                 }
@@ -1296,16 +1571,66 @@ fn stop_managed(processes: &Arc<Mutex<Processes>>, name: &str) -> Result<(), (St
     Ok(())
 }
 
+#[cfg(target_os = "windows")]
+fn terminate_managed(
+    processes: &Arc<Mutex<Processes>>,
+    name: &str,
+) -> Result<(), (StatusCode, String)> {
+    let mut processes = processes
+        .lock()
+        .map_err(|_| (StatusCode::INTERNAL_SERVER_ERROR, "Estado ocupado.".into()))?;
+    let child = if name == "mysql" {
+        processes.mysql.as_mut()
+    } else {
+        processes.php.as_mut()
+    };
+    if let Some(child) = child {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    if name == "mysql" {
+        processes.mysql = None;
+        processes.mysql_bin = None;
+        processes.mysql_port = None;
+    } else {
+        processes.php = None;
+        processes.php_port = None;
+        processes.php_project = None;
+    }
+    Ok(())
+}
+
 fn api_error(error: impl std::fmt::Display) -> (StatusCode, String) {
     (StatusCode::BAD_GATEWAY, error.to_string())
 }
 
 #[cfg(target_os = "windows")]
-fn open_browser(url: &str) -> io::Result<()> {
-    Command::new("cmd")
-        .args(["/C", "start", "", url])
-        .spawn()
-        .map(|_| ())
+fn run_desktop(url: &str) -> Result<(), Box<dyn std::error::Error>> {
+    use tao::{
+        event::{Event, WindowEvent},
+        event_loop::{ControlFlow, EventLoop},
+        window::WindowBuilder,
+    };
+
+    let event_loop = EventLoop::new();
+    let window = WindowBuilder::new()
+        .with_title("Xhamp Rust")
+        .with_inner_size(tao::dpi::LogicalSize::new(1180.0, 800.0))
+        .with_min_inner_size(tao::dpi::LogicalSize::new(760.0, 560.0))
+        .build(&event_loop)?;
+    let _webview = wry::WebViewBuilder::new().with_url(url)?.build(&window)?;
+
+    event_loop.run(|event, target| {
+        target.set_control_flow(ControlFlow::Wait);
+        if let Event::WindowEvent {
+            event: WindowEvent::CloseRequested,
+            ..
+        } = event
+        {
+            target.exit();
+        }
+    })?;
+    Ok(())
 }
 
 #[cfg(target_os = "macos")]
@@ -1320,7 +1645,8 @@ fn open_browser(url: &str) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{valid_project_name, valid_version, version_cmp};
+    use super::{migrate_legacy_projects, valid_project_name, valid_version, version_cmp};
+    use std::{fs, time::SystemTime};
 
     #[test]
     fn project_names_are_limited_to_safe_directory_names() {
@@ -1342,6 +1668,29 @@ mod tests {
         assert!(version_cmp("8.10.0", "8.9.9").is_gt());
         assert!(version_cmp("11.8.9", "10.11.20").is_gt());
         assert!(version_cmp("8.4.27-1", "8.4.27-2").is_lt());
+    }
+
+    #[test]
+    fn legacy_projects_are_copied_to_htdocs_without_removing_the_source() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!("xhamp-rust-migration-{unique}"));
+        let old_project = root.join("projects").join("demo");
+        let new_project = root.join("htdocs").join("demo");
+        fs::create_dir_all(&old_project).unwrap();
+        fs::create_dir_all(root.join("htdocs")).unwrap();
+        fs::write(old_project.join("index.php"), "<?php echo 'ok';").unwrap();
+
+        migrate_legacy_projects(&root).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(new_project.join("index.php")).unwrap(),
+            "<?php echo 'ok';"
+        );
+        assert!(old_project.join("index.php").is_file());
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
